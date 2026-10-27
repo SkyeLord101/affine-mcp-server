@@ -485,6 +485,8 @@ type DatabaseIntentColumnSpec = {
   type: "rich-text" | "select" | "multi-select" | "number" | "checkbox" | "link" | "date";
   options?: string[];
   width?: number;
+  decimal?: number;
+  format?: DatabaseNumberFormat;
 };
 type DatabaseIntentPreset = {
   title: string;
@@ -494,6 +496,234 @@ type DatabaseIntentPreset = {
   starterRows: DatabaseIntentSeedRow[];
 };
 const DATABASE_COLUMN_TYPE_VALUES = ["title", "rich-text", "select", "multi-select", "number", "checkbox", "link", "date"] as const;
+// Mirrors AFFiNE's number property preset (blocksuite/affine/data-view/src/property-presets/number).
+export const DATABASE_NUMBER_FORMAT_VALUES = [
+  "number",
+  "numberWithCommas",
+  "percent",
+  "currencyYen",
+  "currencyINR",
+  "currencyCNY",
+  "currencyUSD",
+  "currencyEUR",
+  "currencyGBP",
+] as const;
+export type DatabaseNumberFormat = typeof DATABASE_NUMBER_FORMAT_VALUES[number];
+const DatabaseNumberFormat = z.enum(DATABASE_NUMBER_FORMAT_VALUES);
+export const DATABASE_NUMBER_DECIMAL_MIN = 0;
+export const DATABASE_NUMBER_DECIMAL_MAX = 8;
+export const DATABASE_NUMBER_DEFAULT_DECIMAL = 0;
+export const DATABASE_NUMBER_DEFAULT_FORMAT: DatabaseNumberFormat = "number";
+const DATABASE_KNOWN_COLUMN_TYPES = new Set<string>(DATABASE_COLUMN_TYPE_VALUES);
+
+export const DATABASE_SELECT_COLORS = [
+  "var(--affine-tag-blue)", "var(--affine-tag-green)", "var(--affine-tag-red)",
+  "var(--affine-tag-orange)", "var(--affine-tag-purple)", "var(--affine-tag-yellow)",
+  "var(--affine-tag-teal)", "var(--affine-tag-pink)", "var(--affine-tag-gray)",
+];
+
+export type DatabaseColumnDataInput = {
+  options?: string[];
+  decimal?: number;
+  format?: DatabaseNumberFormat;
+};
+
+export type DatabaseColumnDataInspection = {
+  status: "ok" | "missing" | "invalid" | "unsupported";
+  issues: string[];
+  summary: Record<string, unknown>;
+};
+
+function databaseDataField(data: unknown, key: string): unknown {
+  if (data instanceof Y.Map) return data.get(key);
+  if (isPlainObjectRecord(data)) return data[key];
+  return undefined;
+}
+
+function databaseDataJson(data: unknown): Record<string, unknown> {
+  if (data instanceof Y.Map) return data.toJSON();
+  if (isPlainObjectRecord(data)) return { ...data };
+  return {};
+}
+
+function isValidDatabaseNumberDecimal(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= DATABASE_NUMBER_DECIMAL_MIN
+    && value <= DATABASE_NUMBER_DECIMAL_MAX;
+}
+
+function isValidDatabaseNumberFormat(value: unknown): value is DatabaseNumberFormat {
+  return typeof value === "string" && (DATABASE_NUMBER_FORMAT_VALUES as readonly string[]).includes(value);
+}
+
+/** Convert plain JSON into nested Yjs maps/arrays, the shape AFFiNE stores column settings in. */
+function jsonToYValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    const array = new Y.Array<any>();
+    array.push(value.map(jsonToYValue));
+    return array;
+  }
+  if (isPlainObjectRecord(value)) {
+    const map = new Y.Map<any>();
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry !== undefined) map.set(key, jsonToYValue(entry));
+    }
+    return map;
+  }
+  return value;
+}
+
+/** The `data` AFFiNE writes when a user creates a column of this type in the UI. */
+export function defaultDatabaseColumnDataJson(
+  type: string,
+  input: DatabaseColumnDataInput = {},
+  generateOptionId: () => string = secureAffineId,
+): Record<string, unknown> {
+  switch (type) {
+    case "select":
+    case "multi-select":
+      return {
+        options: (input.options ?? []).map((value, index) => ({
+          id: generateOptionId(),
+          value,
+          color: DATABASE_SELECT_COLORS[index % DATABASE_SELECT_COLORS.length],
+        })),
+      };
+    case "number":
+      return {
+        decimal: input.decimal ?? DATABASE_NUMBER_DEFAULT_DECIMAL,
+        format: input.format ?? DATABASE_NUMBER_DEFAULT_FORMAT,
+      };
+    default:
+      return {};
+  }
+}
+
+/** Build a database column Y.Map with the settings block AFFiNE's UI requires. */
+export function createDatabaseColumnDefinition(input: {
+  id: string;
+  name: string;
+  type: string;
+  width?: number;
+} & DatabaseColumnDataInput): Y.Map<any> {
+  const column = new Y.Map<any>();
+  column.set("id", input.id);
+  column.set("name", input.name);
+  column.set("type", input.type);
+  column.set("width", input.width ?? 200);
+  column.set("data", jsonToYValue(defaultDatabaseColumnDataJson(input.type, input)));
+  return column;
+}
+
+/** Report whether a column's `data` has the shape AFFiNE's renderers and header menu expect. */
+export function inspectDatabaseColumnData(type: string, data: unknown): DatabaseColumnDataInspection {
+  if (!DATABASE_KNOWN_COLUMN_TYPES.has(type)) {
+    return { status: "unsupported", issues: [], summary: {} };
+  }
+  if (data === undefined || data === null) {
+    return { status: "missing", issues: ["data is missing"], summary: {} };
+  }
+  if (!(data instanceof Y.Map) && !isPlainObjectRecord(data)) {
+    return { status: "invalid", issues: ["data is not an object"], summary: {} };
+  }
+
+  const issues: string[] = [];
+  const summary: Record<string, unknown> = {};
+  if (type === "select" || type === "multi-select") {
+    const options = databaseDataField(data, "options");
+    if (options instanceof Y.Array || Array.isArray(options)) {
+      summary.optionCount = options.length;
+    } else {
+      issues.push("data.options is not an array");
+    }
+  } else if (type === "number") {
+    const decimal = databaseDataField(data, "decimal");
+    const format = databaseDataField(data, "format");
+    summary.decimal = decimal ?? null;
+    summary.format = format ?? null;
+    if (!isValidDatabaseNumberDecimal(decimal)) {
+      issues.push(`data.decimal must be an integer from ${DATABASE_NUMBER_DECIMAL_MIN} to ${DATABASE_NUMBER_DECIMAL_MAX}`);
+    }
+    if (!isValidDatabaseNumberFormat(format)) {
+      issues.push(`data.format must be one of ${DATABASE_NUMBER_FORMAT_VALUES.join(", ")}`);
+    }
+  }
+  return { status: issues.length > 0 ? "invalid" : "ok", issues, summary };
+}
+
+/**
+ * Return the repaired `data` JSON for a column, or null when it is already valid.
+ * Valid fields are kept; only missing or malformed fields get AFFiNE's defaults.
+ */
+export function repairedDatabaseColumnDataJson(type: string, data: unknown): Record<string, unknown> | null {
+  const inspection = inspectDatabaseColumnData(type, data);
+  if (inspection.status === "ok" || inspection.status === "unsupported") {
+    return null;
+  }
+
+  const repaired = databaseDataJson(data);
+  const defaults = defaultDatabaseColumnDataJson(type);
+  if (type === "select" || type === "multi-select") {
+    if (!Array.isArray(repaired.options)) repaired.options = defaults.options;
+  } else if (type === "number") {
+    if (!isValidDatabaseNumberDecimal(repaired.decimal)) repaired.decimal = defaults.decimal;
+    if (!isValidDatabaseNumberFormat(repaired.format)) repaired.format = defaults.format;
+  }
+  return repaired;
+}
+
+export type DatabaseColumnRepair = {
+  id: string;
+  name: string | null;
+  type: string;
+  status: DatabaseColumnDataInspection["status"];
+  issues: string[];
+  before: unknown;
+  after: Record<string, unknown>;
+};
+
+/**
+ * Add AFFiNE's default `data` to every column in a database block that is missing it
+ * or holds an invalid shape. Never touches cells. With apply=false only reports.
+ */
+export function repairDatabaseColumnsData(dbBlock: Y.Map<any>, apply: boolean): DatabaseColumnRepair[] {
+  const columns = dbBlock.get("prop:columns");
+  if (!(columns instanceof Y.Array)) return [];
+
+  const repairs: DatabaseColumnRepair[] = [];
+  for (let index = 0; index < columns.length; index += 1) {
+    const column = columns.get(index);
+    const isYColumn = column instanceof Y.Map;
+    if (!isYColumn && !isPlainObjectRecord(column)) continue;
+
+    const field = (key: string) => isYColumn ? column.get(key) : (column as Record<string, unknown>)[key];
+    const type = String(field("type") ?? "");
+    const data = field("data");
+    const after = repairedDatabaseColumnDataJson(type, data);
+    if (!after) continue;
+
+    const inspection = inspectDatabaseColumnData(type, data);
+    repairs.push({
+      id: String(field("id") ?? ""),
+      name: typeof field("name") === "string" ? field("name") as string : null,
+      type,
+      status: inspection.status,
+      issues: inspection.issues,
+      before: data instanceof Y.Map ? data.toJSON() : data ?? null,
+      after,
+    });
+    if (!apply) continue;
+
+    if (isYColumn) {
+      column.set("data", jsonToYValue(after));
+    } else {
+      columns.delete(index, 1);
+      columns.insert(index, [{ ...(column as Record<string, unknown>), data: after }]);
+    }
+  }
+  return repairs;
+}
 
 const MARKDOWN_IMPORT_KNOWN_LOSSES = [
   "Nested markdown lists are flattened during import.",
@@ -1292,11 +1522,7 @@ export function registerDocTools(
     return await gql.getConnectionAuth();
   }
 
-  const SELECT_COLORS = [
-    "var(--affine-tag-blue)", "var(--affine-tag-green)", "var(--affine-tag-red)",
-    "var(--affine-tag-orange)", "var(--affine-tag-purple)", "var(--affine-tag-yellow)",
-    "var(--affine-tag-teal)", "var(--affine-tag-pink)", "var(--affine-tag-gray)",
-  ];
+  const SELECT_COLORS = DATABASE_SELECT_COLORS;
 
   function makeText(content: string | TextDelta[]): Y.Text {
     const yText = new Y.Text();
@@ -2545,36 +2771,6 @@ export function registerDocTools(
     });
   }
 
-  function createDatabaseColumnDefinition(input: {
-    id: string;
-    name: string;
-    type: string;
-    width?: number;
-    options?: string[];
-  }): Y.Map<any> {
-    const column = new Y.Map<any>();
-    column.set("id", input.id);
-    column.set("name", input.name);
-    column.set("type", input.type);
-    column.set("width", input.width ?? 200);
-
-    if ((input.type === "select" || input.type === "multi-select") && input.options?.length) {
-      const data = new Y.Map<any>();
-      const options = new Y.Array<any>();
-      input.options.forEach((value, index) => {
-        const option = new Y.Map<any>();
-        option.set("id", generateId());
-        option.set("value", value);
-        option.set("color", SELECT_COLORS[index % SELECT_COLORS.length]);
-        options.push([option]);
-      });
-      data.set("options", options);
-      column.set("data", data);
-    }
-
-    return column;
-  }
-
   function addDatabaseColumnToBlock(dbBlock: Y.Map<any>, spec: DatabaseIntentColumnSpec): string {
     const columns = dbBlock.get("prop:columns");
     if (!(columns instanceof Y.Array)) {
@@ -2597,6 +2793,8 @@ export function registerDocTools(
       type: spec.type,
       width: spec.width,
       options: spec.options,
+      decimal: spec.decimal,
+      format: spec.format,
     })]);
 
     const views = dbBlock.get("prop:views");
@@ -6298,6 +6496,11 @@ export function registerDocTools(
         advancedViewMutation: false,
         intentDrivenComposition: true,
         linkedDocRows: true,
+        columnSettingsData: true,
+        numberFormats: [...DATABASE_NUMBER_FORMAT_VALUES],
+        numberDecimalRange: [DATABASE_NUMBER_DECIMAL_MIN, DATABASE_NUMBER_DECIMAL_MAX],
+        columnManagementTools: ["update_database_column", "repair_database_columns", "delete_database_column"]
+          .filter(tool => (defaults.toolSurface?.enabledTools ?? ALL_TOOLS).includes(tool as any)),
       },
       workspace: {
         organizeToolsExperimental: true,
@@ -7951,6 +8154,10 @@ export function registerDocTools(
         const cloned = cloneNativeTemplateValue(rawBlock, cloneContext, `blocks.${String(sourceBlockId)}`) as Y.Map<any>;
         cloned.set("sys:id", nextBlockId);
         targetBlocks.set(nextBlockId, cloned);
+        // Templates authored by older tools may carry columns without settings; AFFiNE's UI needs them.
+        if (cloned.get("sys:flavour") === "affine:database") {
+          repairDatabaseColumnsData(cloned, true);
+        }
       }
 
       const pageId = findBlockIdByFlavour(targetBlocks, "affine:page");
@@ -8879,12 +9086,21 @@ export function registerDocTools(
     if (!workspaceId) throw new Error("workspaceId is required");
     const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
     try {
-      const columns = ctx.columnDefs.map(col => ({
-        id: col.id,
-        name: col.name || null,
-        type: col.type,
-        options: col.options,
-      }));
+      const columns = ctx.columnDefs.map(col => {
+        const data = col.raw instanceof Y.Map ? col.raw.get("data") : col.raw?.data;
+        const inspection = inspectDatabaseColumnData(col.type, data);
+        return {
+          id: col.id,
+          name: col.name || null,
+          type: col.type,
+          options: col.options,
+          data: data instanceof Y.Map ? data.toJSON() : data ?? null,
+          dataSummary: inspection.summary,
+          dataStatus: inspection.status,
+          dataIssues: inspection.issues,
+          needsRepair: inspection.status === "missing" || inspection.status === "invalid",
+        };
+      });
 
       return text({
         databaseBlockId: parsed.databaseBlockId,
@@ -8903,7 +9119,7 @@ export function registerDocTools(
     "read_database_columns",
     {
       title: "Read Database Columns",
-      description: "Read schema metadata for an AFFiNE database block, including columns, select options, and view column mappings. Useful for empty databases before any rows exist.",
+      description: "Read schema metadata for an AFFiNE database block, including columns, select options, each column's settings `data` (with a dataStatus of ok/missing/invalid and needsRepair flag), and view column mappings. Useful for empty databases before any rows exist.",
       inputSchema: {
         workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
         docId: DocId.describe("Document ID containing the database"),
@@ -9124,9 +9340,15 @@ export function registerDocTools(
     type: string;
     options?: string[];
     width?: number;
+    decimal?: number;
+    format?: DatabaseNumberFormat;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required");
+    const columnType = parsed.type || "rich-text";
+    if ((parsed.decimal !== undefined || parsed.format !== undefined) && columnType !== "number") {
+      throw new Error("decimal and format only apply to number columns");
+    }
 
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
@@ -9161,28 +9383,15 @@ export function registerDocTools(
       }
 
       const columnId = generateId();
-      const column = new Y.Map<any>();
-      column.set("id", columnId);
-      column.set("name", parsed.name);
-      column.set("type", parsed.type || "rich-text");
-      column.set("width", parsed.width || 200);
-
-      // For select/multi-select, create options
-      if ((parsed.type === "select" || parsed.type === "multi-select") && parsed.options?.length) {
-        const data = new Y.Map<any>();
-        const opts = new Y.Array<any>();
-        for (let i = 0; i < parsed.options.length; i++) {
-          const optMap = new Y.Map<any>();
-          optMap.set("id", generateId());
-          optMap.set("value", parsed.options[i]);
-          optMap.set("color", SELECT_COLORS[i % SELECT_COLORS.length]);
-          opts.push([optMap]);
-        }
-        data.set("options", opts);
-        column.set("data", data);
-      }
-
-      columns.push([column]);
+      columns.push([createDatabaseColumnDefinition({
+        id: columnId,
+        name: parsed.name,
+        type: columnType,
+        width: parsed.width || 200,
+        options: parsed.type === "select" || parsed.type === "multi-select" ? parsed.options : undefined,
+        decimal: parsed.decimal,
+        format: parsed.format,
+      })]);
 
       // Also add the column to all existing views so it's visible
       const views = dbBlock.get("prop:views");
@@ -9254,7 +9463,7 @@ export function registerDocTools(
         added: true,
         columnId,
         name: parsed.name,
-        type: parsed.type || "rich-text",
+        type: columnType,
       });
     } finally {
       socket.disconnect();
@@ -9273,9 +9482,270 @@ export function registerDocTools(
         type: z.enum(DATABASE_COLUMN_TYPE_VALUES).default("rich-text").describe("Column type"),
         options: z.array(z.string()).optional().describe("Predefined options for select/multi-select columns"),
         width: z.number().optional().describe("Column width in pixels (default 200)"),
+        decimal: z.number().int().min(DATABASE_NUMBER_DECIMAL_MIN).max(DATABASE_NUMBER_DECIMAL_MAX).optional().describe("Number columns only: decimal places shown (0-8, default 0, AFFiNE's default)"),
+        format: DatabaseNumberFormat.optional().describe("Number columns only: display format (default 'number', AFFiNE's default)"),
       },
     },
     addDatabaseColumnHandler as any
+  );
+
+  /** Find a database column by name or ID, or throw with the available column names. */
+  function requireDatabaseColumn(key: string, lookup: DatabaseColumnLookup): DatabaseColumnDef {
+    const col = findDatabaseColumn(key, lookup);
+    if (!col) {
+      throw new Error(`Column '${key}' not found. Available columns: ${availableDatabaseColumns(lookup)}`);
+    }
+    if (!(col.raw instanceof Y.Map)) {
+      throw new Error(`Column '${col.name || col.id}' has an unsupported storage shape`);
+    }
+    return col;
+  }
+
+  /** Apply `mutate` to every view's column entry for `columnId`, preserving Yjs or plain storage. */
+  function updateDatabaseViewColumns(
+    dbBlock: Y.Map<any>,
+    columnId: string,
+    mutate: (entry: Record<string, unknown>) => Record<string, unknown> | null,
+  ): void {
+    const views = dbBlock.get("prop:views");
+    if (!(views instanceof Y.Array)) return;
+    for (let viewIndex = 0; viewIndex < views.length; viewIndex += 1) {
+      const view = views.get(viewIndex);
+      const viewColumns = databaseRecordValue(view, "columns");
+      if (view instanceof Y.Map && viewColumns instanceof Y.Array) {
+        for (let index = viewColumns.length - 1; index >= 0; index -= 1) {
+          const entry = viewColumns.get(index);
+          const entryJson = entry instanceof Y.Map ? entry.toJSON() : entry;
+          if (entryJson?.id !== columnId) continue;
+          const next = mutate({ ...entryJson });
+          if (next === null) {
+            viewColumns.delete(index, 1);
+          } else if (entry instanceof Y.Map) {
+            for (const [key, value] of Object.entries(next)) {
+              if (entry.get(key) !== value) entry.set(key, value);
+            }
+          } else {
+            viewColumns.delete(index, 1);
+            viewColumns.insert(index, [next]);
+          }
+        }
+        continue;
+      }
+
+      const plainColumns = databaseArrayValues(viewColumns).map(entry =>
+        entry instanceof Y.Map ? entry.toJSON() : entry
+      );
+      if (!plainColumns.some((entry: any) => entry?.id === columnId)) continue;
+      const nextColumns = plainColumns
+        .map((entry: any) => entry?.id === columnId ? mutate({ ...entry }) : entry)
+        .filter(entry => entry !== null);
+      if (view instanceof Y.Map) {
+        view.set("columns", nextColumns);
+      } else if (view && typeof view === "object") {
+        views.delete(viewIndex, 1);
+        views.insert(viewIndex, [{ ...(view as Record<string, unknown>), columns: nextColumns }]);
+      }
+    }
+  }
+
+  // UPDATE DATABASE COLUMN
+  const updateDatabaseColumnHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    column: string;
+    name?: string;
+    type?: string;
+    decimal?: number;
+    format?: DatabaseNumberFormat;
+    width?: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const col = requireDatabaseColumn(parsed.column, ctx);
+      const rawCol = col.raw as Y.Map<any>;
+      if (parsed.type !== undefined && parsed.type !== col.type) {
+        throw new Error(`update_database_column cannot change a column's type (column '${col.name || col.id}' is '${col.type}')`);
+      }
+      if (parsed.name === undefined && parsed.decimal === undefined && parsed.format === undefined && parsed.width === undefined) {
+        throw new Error("Provide at least one of name, decimal, format, or width");
+      }
+      if ((parsed.decimal !== undefined || parsed.format !== undefined) && col.type !== "number") {
+        throw new Error(`decimal and format only apply to number columns (column '${col.name || col.id}' is '${col.type}')`);
+      }
+
+      const changes: string[] = [];
+      if (parsed.name !== undefined) {
+        const nextName = parsed.name.trim();
+        if (!nextName) throw new Error("name must not be empty");
+        if (ctx.columnDefs.some(other => other.id !== col.id && other.name === nextName)) {
+          throw new Error(`Column '${nextName}' already exists`);
+        }
+        rawCol.set("name", nextName);
+        changes.push("name");
+      }
+
+      if (parsed.decimal !== undefined || parsed.format !== undefined) {
+        const current = rawCol.get("data");
+        const next = repairedDatabaseColumnDataJson(col.type, current) ?? databaseDataJson(current);
+        if (parsed.decimal !== undefined) next.decimal = parsed.decimal;
+        if (parsed.format !== undefined) next.format = parsed.format;
+        if (current instanceof Y.Map) {
+          current.set("decimal", next.decimal);
+          current.set("format", next.format);
+        } else {
+          rawCol.set("data", jsonToYValue(next));
+        }
+        if (parsed.decimal !== undefined) changes.push("decimal");
+        if (parsed.format !== undefined) changes.push("format");
+      }
+
+      if (parsed.width !== undefined) {
+        rawCol.set("width", parsed.width);
+        updateDatabaseViewColumns(ctx.dbBlock, col.id, entry => ({ ...entry, width: parsed.width }));
+        changes.push("width");
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      const data = rawCol.get("data");
+      return text({
+        updated: true,
+        columnId: col.id,
+        name: String(rawCol.get("name") ?? ""),
+        type: col.type,
+        changes,
+        data: data instanceof Y.Map ? data.toJSON() : data ?? null,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "update_database_column",
+    {
+      title: "Update Database Column",
+      description: "Rename an AFFiNE database column, change a number column's decimal places or display format, or set its width. Column type changes are rejected. Cell values are not touched.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        column: z.string().min(1).describe("Column name or column ID to update"),
+        name: z.string().min(1).optional().describe("New column display name"),
+        type: z.enum(DATABASE_COLUMN_TYPE_VALUES).optional().describe("Optional guard: must equal the current type. Type changes are rejected."),
+        decimal: z.number().int().min(DATABASE_NUMBER_DECIMAL_MIN).max(DATABASE_NUMBER_DECIMAL_MAX).optional().describe("Number columns only: decimal places shown (0-8)"),
+        format: DatabaseNumberFormat.optional().describe("Number columns only: display format"),
+        width: z.number().int().min(TABLE_COLUMN_MIN_WIDTH).max(TABLE_COLUMN_MAX_WIDTH).optional().describe("Column width in pixels, applied to the column and every view"),
+      },
+    },
+    updateDatabaseColumnHandler as any
+  );
+
+  // REPAIR DATABASE COLUMNS
+  const repairDatabaseColumnsHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    dryRun?: boolean;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const dryRun = parsed.dryRun === true;
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const repairs = repairDatabaseColumnsData(ctx.dbBlock, !dryRun);
+      if (!dryRun && repairs.length > 0) {
+        const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+        await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      }
+
+      return text({
+        databaseBlockId: parsed.databaseBlockId,
+        dryRun,
+        repairedCount: dryRun ? 0 : repairs.length,
+        columnCount: ctx.columnDefs.length,
+        columns: repairs,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "repair_database_columns",
+    {
+      title: "Repair Database Columns",
+      description: "Add AFFiNE's default settings `data` to database columns that are missing it or hold an invalid shape (e.g. number columns without decimal/format, which render blank and break the column header menu). Never touches cell values. Use dryRun to report changes without writing.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        dryRun: z.boolean().optional().describe("If true, report what would change without writing (default false)"),
+      },
+    },
+    repairDatabaseColumnsHandler as any
+  );
+
+  // DELETE DATABASE COLUMN
+  const deleteDatabaseColumnHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    column: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const col = requireDatabaseColumn(parsed.column, ctx);
+      // AFFiNE treats the title property as fixed and never deletes it.
+      if (col.type === "title") {
+        throw new Error("The title column cannot be deleted");
+      }
+      const groupingViews = databaseArrayValues(ctx.dbBlock.get("prop:views"))
+        .filter(view => databaseRecordValue(databaseRecordValue(view, "groupBy"), "columnId") === col.id)
+        .map(view => String(databaseRecordValue(view, "name") ?? databaseRecordValue(view, "id")));
+      if (groupingViews.length > 0) {
+        throw new Error(`Column '${col.name || col.id}' groups view(s): ${groupingViews.join(", ")}. Change their grouping first.`);
+      }
+
+      const columns = ctx.dbBlock.get("prop:columns") as Y.Array<any>;
+      const index = columns.toArray().indexOf(col.raw);
+      if (index < 0) throw new Error(`Column '${col.name || col.id}' not found in columns array`);
+      columns.delete(index, 1);
+      // Mirrors AFFiNE's propertyDelete: cells are left in place; view entries are pruned.
+      updateDatabaseViewColumns(ctx.dbBlock, col.id, () => null);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushPageDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        deleted: true,
+        columnId: col.id,
+        name: col.name || null,
+        databaseBlockId: parsed.databaseBlockId,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "delete_database_column",
+    {
+      title: "Delete Database Column",
+      description: "Delete a column from an AFFiNE database block, as AFFiNE's own column delete does: the column definition and its view entries are removed; stored cell values are left in place. The title column and columns used for view grouping cannot be deleted.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        column: z.string().min(1).describe("Column name or column ID to delete"),
+      },
+    },
+    deleteDatabaseColumnHandler as any
   );
 
   type SurfaceElementType = "shape" | "connector" | "text" | "group";

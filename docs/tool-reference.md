@@ -251,10 +251,13 @@ Custom properties use AFFiNE's workspace-scoped tables. To recover values writte
 | Tool | Purpose | Notes |
 | --- | --- | --- |
 | `compose_database_from_intent` | Create or enrich a database block from a high-level schema intent | Useful for project boards and structured tables |
-| `add_database_column` | Add a column to a database block | Supports `title`, `rich-text`, `select`, `multi-select`, `number`, `checkbox`, `link`, and `date`; rejects a title addition when the current snapshot already contains one |
+| `add_database_column` | Add a column to a database block | Supports `title`, `rich-text`, `select`, `multi-select`, `number`, `checkbox`, `link`, and `date`; rejects a title addition when the current snapshot already contains one. Every column gets AFFiNE's default settings `data`; number columns accept `decimal` (0-8, default 0) and `format` (default `number`) |
+| `update_database_column` | Rename a column, set number `decimal`/`format`, or set width | Type changes are rejected; cell values are not touched |
+| `repair_database_columns` | Add default settings `data` to columns missing it or holding an invalid shape | Fixes blank number cells and dead header menus on columns created by older versions; `dryRun` reports without writing; never touches cells |
 | `add_database_row` | Add a row to a database block | Rich-text and title values accept strings or delta arrays |
 | `delete_database_row` | Delete a row by row block id | Destructive |
-| `read_database_columns` | Read schema metadata, types, options, and view mappings | Useful before edits |
+| `delete_database_column` | Delete a column and its view entries | Destructive; title and grouping columns are rejected; cell values are left in place, as AFFiNE does |
+| `read_database_columns` | Read schema metadata, types, options, settings `data`, and view mappings | Useful before edits; `dataStatus`/`needsRepair` flag columns `repair_database_columns` would fix |
 | `read_database_cells` | Read row titles and decoded cell values | Rich-text titles and cells include plain values and formatting-preserving deltas |
 | `update_database_row` | Update multiple cells on a row at once | Rich-text deltas are preserved; `createOption` defaults to `true` |
 
