@@ -1,0 +1,79 @@
+name: Fork Image
+
+# Builds the SkyeLord101 fork image. Tags are `image-<upstream version>-<suffix>`
+# (e.g. image-3.10.2-skye.1 -> ghcr.io/skyelord101/affine-mcp-server:3.10.2-skye.1).
+# The `image-` prefix keeps these tags clear of upstream's `v*` release and npm workflows.
+on:
+  push:
+    tags:
+      - 'image-*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: skyelord101/affine-mcp-server
+
+jobs:
+  build-and-push:
+    if: github.repository_owner == 'SkyeLord101'
+    name: Test, Build & Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve image tag
+        id: version
+        run: |
+          IMAGE_TAG="${GITHUB_REF_NAME#image-}"
+          PACKAGE_VERSION="$(node -p 'require("./package.json").version')"
+          case "$IMAGE_TAG" in
+            "$PACKAGE_VERSION"-*) ;;
+            *) echo "Tag $GITHUB_REF_NAME must be image-$PACKAGE_VERSION-<suffix>"; exit 1 ;;
+          esac
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=affine-mcp-server
+            org.opencontainers.image.description=affine-mcp-server fork with AFFiNE-compatible database column settings
+            org.opencontainers.image.source=https://github.com/SkyeLord101/affine-mcp-server
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
